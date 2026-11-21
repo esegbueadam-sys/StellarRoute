@@ -8,6 +8,7 @@ pub mod broadcast;
 pub mod budget;
 pub mod cache;
 pub mod cctp;
+pub mod client_ip;
 pub mod compression;
 pub mod consistency_guard;
 pub mod dependency_health;

@@ -174,6 +174,19 @@ pub struct Server {
 impl Server {
     /// Create a new API server
     pub async fn new(config: ServerConfig, db: DatabasePools) -> Self {
+        let trusted_proxies = crate::client_ip::TrustedProxyConfig::from_env();
+        if trusted_proxies.is_empty() {
+            info!(
+                "No trusted reverse proxies configured ({} unset); forwarded headers will be ignored",
+                crate::client_ip::TRUSTED_PROXY_CIDRS_ENV
+            );
+        } else {
+            info!(
+                trusted_proxies = %trusted_proxies,
+                "Trusted reverse proxy ranges configured; forwarding headers are only honored from these peers"
+            );
+        }
+
         let cache_policy = CachePolicy {
             quote_ttl: std::time::Duration::from_secs(config.quote_cache_ttl_seconds),
         };
@@ -193,10 +206,12 @@ impl Server {
                             Ok(conn) => {
                                 info!("✅ Rate limiter using Redis backend");
                                 RateLimitLayer::with_redis(conn, EndpointConfig::default())
+                                    .with_trusted_proxies(trusted_proxies.clone())
                             }
                             Err(e) => {
                                 warn!("⚠️  Redis rate limiter connection failed ({}), using in-memory fallback", e);
                                 RateLimitLayer::in_memory(EndpointConfig::default())
+                                    .with_trusted_proxies(trusted_proxies.clone())
                             }
                         },
                         Err(e) => {
@@ -222,7 +237,8 @@ impl Server {
                         state.ws = Some(crate::routes::ws::WsState::from_env());
                         (
                             finalize_app_state(state).await,
-                            RateLimitLayer::in_memory(EndpointConfig::default()),
+                            RateLimitLayer::in_memory(EndpointConfig::default())
+                                .with_trusted_proxies(trusted_proxies.clone()),
                         )
                     }
                 }
@@ -235,7 +251,8 @@ impl Server {
                 state.ws = Some(crate::routes::ws::WsState::from_env());
                 (
                     finalize_app_state(state).await,
-                    RateLimitLayer::in_memory(EndpointConfig::default()),
+                    RateLimitLayer::in_memory(EndpointConfig::default())
+                        .with_trusted_proxies(trusted_proxies.clone()),
                 )
             }
         };

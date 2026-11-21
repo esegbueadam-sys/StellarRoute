@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::{ws::WebSocketUpgrade, ConnectInfo, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use tokio::sync::{Mutex, RwLock};
@@ -100,6 +100,7 @@ const IP_RATE_LIMIT_PER_MINUTE: usize = 10;
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Response {
     // Retrieve WsState — return 503 if WS feature is disabled.
@@ -139,8 +140,15 @@ pub async fn ws_handler(
             .into_response();
     }
 
-    // Check per-IP rate limit (10 new connections per minute).
-    let ip_key = addr.ip().to_string();
+    // Check per-IP rate limit (10 new connections per minute). Resolve the
+    // caller through the same trusted-proxy boundary as the HTTP rate limiter
+    // so clients behind a proxy are bucketed individually.
+    let ip_key = crate::client_ip::resolve_client_ip_from_headers(
+        &headers,
+        Some(addr.ip()),
+        &state.trusted_proxies,
+    )
+    .to_string();
     {
         let mut limiter = ws_state.ip_rate_limiter.lock().await;
         let now = Instant::now();

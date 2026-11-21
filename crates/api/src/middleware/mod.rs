@@ -9,6 +9,7 @@ pub mod request_id;
 pub mod tracing;
 pub mod validation;
 
+pub use crate::client_ip::TrustedProxyConfig;
 pub use admin::{validate_admin_auth_startup, AdminAuth};
 pub use api_versioning::api_versioning_layer;
 pub use auth::{resolve_require_auth, validate_auth_startup, AuthConfig, AuthLayer};

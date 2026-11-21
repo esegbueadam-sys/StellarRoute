@@ -6,10 +6,14 @@
 
 use axum::{
     body::Body,
+    extract::ConnectInfo,
     http::{Request, StatusCode},
 };
 use serde_json::Value;
-use stellarroute_api::middleware::{EndpointConfig, RateLimitConfig, RateLimitLayer};
+use std::net::SocketAddr;
+use stellarroute_api::middleware::{
+    EndpointConfig, RateLimitConfig, RateLimitLayer, TrustedProxyConfig,
+};
 use tower::ServiceExt;
 
 // ---------------------------------------------------------------------------
@@ -215,6 +219,7 @@ async fn rate_limit_returns_429_after_limit_exceeded() {
             window: Duration::from_secs(60),
         },
         tenant_overrides: std::collections::HashMap::new(),
+        ..EndpointConfig::default()
     };
 
     let layer = RateLimitLayer::in_memory(cfg);
@@ -304,6 +309,7 @@ async fn rate_limit_429_content_type_is_json() {
             window: Duration::from_secs(60),
         },
         tenant_overrides: std::collections::HashMap::new(),
+        ..EndpointConfig::default()
     };
 
     let layer = RateLimitLayer::in_memory(cfg);
@@ -348,11 +354,11 @@ async fn rate_limit_429_content_type_is_json() {
 }
 
 // ---------------------------------------------------------------------------
-// x-forwarded-for header respected
+// Trusted proxy boundary
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn different_ips_have_independent_limits() {
+async fn different_client_ips_behind_trusted_proxy_have_independent_limits() {
     use std::time::Duration;
 
     // Set a very low limit so we can exhaust it quickly with one IP
@@ -374,15 +380,19 @@ async fn different_ips_have_independent_limits() {
             window: Duration::from_secs(60),
         },
         tenant_overrides: std::collections::HashMap::new(),
+        ..EndpointConfig::default()
     };
 
     use axum::{routing::get, Router};
     async fn ok() -> &'static str {
         "ok"
     }
-    let router = Router::new()
-        .route("/api/v1/pairs", get(ok))
-        .layer(RateLimitLayer::in_memory(cfg));
+    let router = Router::new().route("/api/v1/pairs", get(ok)).layer(
+        RateLimitLayer::in_memory(cfg)
+            .with_trusted_proxies(TrustedProxyConfig::parse("10.0.0.0/8").unwrap()),
+    );
+
+    let peer = ConnectInfo(SocketAddr::from(([10, 0, 0, 254], 443)));
 
     // IP A: exhaust limit
     router
@@ -390,7 +400,8 @@ async fn different_ips_have_independent_limits() {
         .oneshot(
             Request::builder()
                 .uri("/api/v1/pairs")
-                .header("x-forwarded-for", "10.0.0.1")
+                .header("x-forwarded-for", "203.0.113.1")
+                .extension(peer.clone())
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -403,7 +414,8 @@ async fn different_ips_have_independent_limits() {
         .oneshot(
             Request::builder()
                 .uri("/api/v1/pairs")
-                .header("x-forwarded-for", "10.0.0.1")
+                .header("x-forwarded-for", "203.0.113.1")
+                .extension(peer.clone())
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -416,11 +428,65 @@ async fn different_ips_have_independent_limits() {
         .oneshot(
             Request::builder()
                 .uri("/api/v1/pairs")
-                .header("x-forwarded-for", "10.0.0.2")
+                .header("x-forwarded-for", "203.0.113.2")
+                .extension(peer.clone())
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
     assert_eq!(allowed.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn forwarded_header_is_ignored_from_untrusted_peer() {
+    use std::time::Duration;
+
+    let cfg = EndpointConfig {
+        pairs: RateLimitConfig {
+            max_requests: 1,
+            window: Duration::from_secs(60),
+        },
+        ..EndpointConfig::default()
+    };
+
+    use axum::{routing::get, Router};
+    async fn ok() -> &'static str {
+        "ok"
+    }
+    let router = Router::new().route("/api/v1/pairs", get(ok)).layer(
+        RateLimitLayer::in_memory(cfg)
+            .with_trusted_proxies(TrustedProxyConfig::parse("10.0.0.0/8").unwrap()),
+    );
+
+    // Same untrusted peer, spoofed client IPs in x-forwarded-for: both
+    // requests share one bucket and the second is denied.
+    let peer = ConnectInfo(SocketAddr::from(([192, 0, 2, 10], 443)));
+
+    let first = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/pairs")
+                .header("x-forwarded-for", "203.0.113.1")
+                .extension(peer.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let second = router
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/pairs")
+                .header("x-forwarded-for", "203.0.113.2")
+                .extension(peer.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
 }

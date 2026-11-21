@@ -19,6 +19,20 @@ for the underlying environment variables.
 |---|---|---|
 | Cross-origin requests (all routes) | Any origin (`Access-Control-Allow-Origin: *`) | Only origins listed in `CORS_ALLOWED_ORIGINS`; startup fails if that allowlist is empty |
 
+## Client IP behind a reverse proxy (API-28)
+
+| Surface | Dev/test default | Production default |
+|---|---|---|
+| Caller IP used for per-IP rate limits and admin audit | TCP peer (`ConnectInfo`); forwarding headers ignored | Same, unless the peer is listed in `TRUSTED_PROXY_CIDRS` |
+
+`X-Forwarded-For` and `X-Real-IP` are only read when the request's TCP peer is
+inside the configured allowlist, and the **rightmost untrusted**
+`X-Forwarded-For` hop is used. An empty allowlist trusts nobody, so a stray
+header cannot rotate rate-limit buckets or forge audit actors.
+
+See [`trusted-proxy-client-ip.md`](trusted-proxy-client-ip.md) for the
+resolution algorithm, deployment examples, and tests.
+
 ## Global request auth (issue #1057)
 
 | Surface | Dev/test default | Production default |

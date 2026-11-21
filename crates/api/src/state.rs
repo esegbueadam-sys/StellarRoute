@@ -138,6 +138,9 @@ pub struct AppState {
     pub cache_policy: CachePolicy,
     /// Optional admin auth token used for operator-only endpoints
     pub admin_auth_token: Option<String>,
+    /// Reverse proxies whose forwarding headers may be trusted when resolving
+    /// the caller IP (from `TRUSTED_PROXY_CIDRS`).
+    pub trusted_proxies: crate::client_ip::TrustedProxyConfig,
     /// Cache hit/miss counters
     pub cache_metrics: Arc<CacheMetrics>,
     /// Route computation worker pool
@@ -255,6 +258,7 @@ impl AppState {
             version: env!("CARGO_PKG_VERSION").to_string(),
             cache_policy,
             admin_auth_token: None,
+            trusted_proxies: crate::client_ip::TrustedProxyConfig::from_env(),
             cache_metrics: Arc::new(CacheMetrics::default()),
             worker_pool,
             quote_single_flight: Arc::new(SingleFlight::<
@@ -415,6 +419,7 @@ impl AppState {
             version: env!("CARGO_PKG_VERSION").to_string(),
             cache_policy,
             admin_auth_token: None,
+            trusted_proxies: crate::client_ip::TrustedProxyConfig::from_env(),
             cache_metrics: Arc::new(CacheMetrics::default()),
             worker_pool,
             quote_single_flight: Arc::new(SingleFlight::<
