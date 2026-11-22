@@ -125,6 +125,7 @@ endpoint-by-endpoint inventory.
 | `PUBLIC_GET_ROUTES` | string (comma-separated path prefixes) | *(empty)* | Optional | API | Explicit allowlist of routes that stay reachable via unauthenticated `GET` even when `REQUIRE_AUTH=true` (e.g. public quote/orderbook reads for a browser frontend). Never exempts non-GET methods, and never applies to `/api/v1/admin/*` or `/api/v1/system/*`. **CCTP** `/api/v2/bridge/cctp/*` is exempt from the global API-key gate separately: quote stays public+rate-limited; transfer routes use `x-cctp-transfer-access` |
 | `ALLOW_INSECURE_PUBLIC_API` | boolean | `false` | Optional | API | Break-glass override acknowledging `STELLARROUTE_ENV=production` with auth disabled. Without it, the API refuses to boot in that configuration; with it, it boots and logs a warning. Never set this in a real production deployment |
 | `ADMIN_AUTH_TOKEN` | string | — | Optional (required to use admin/operator endpoints) | API | Bearer/`x-admin-token` for `/api/v1/admin/*`, `/api/v1/system/*`, and (in production) `/metrics`, `/metrics/cache`, `/metrics/pool`, `/api/v1/replay/*`. Requests are denied when unset, even without a token |
+| `TRUSTED_PROXY_CIDRS` | string (comma-separated IPs/CIDRs) | *(empty = trust no proxy)* | Optional | API | Reverse-proxy peers whose `X-Forwarded-For` / `X-Real-IP` headers may be trusted when resolving the caller IP for rate limiting and admin audit. See [`docs/api/trusted-proxy-client-ip.md`](../api/trusted-proxy-client-ip.md). Never use `0.0.0.0/0` |
 
 ### Integrator API keys vs. browser public GETs
 

@@ -24,7 +24,7 @@
 
 use axum::{
     body::Body,
-    extract::Request,
+    extract::{ConnectInfo, Request},
     http::{header::HeaderName, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -32,7 +32,7 @@ use axum::{
 use redis::{aio::ConnectionManager, AsyncCommands};
 use std::{
     collections::HashMap,
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -40,7 +40,10 @@ use tokio::sync::Mutex;
 use tower::{Layer, Service};
 use tracing::{debug, warn};
 
-use crate::models::{ApiErrorCode, ErrorResponse};
+use crate::{
+    client_ip::{resolve_client_ip_from_headers, TrustedProxyConfig},
+    models::{ApiErrorCode, ErrorResponse},
+};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -328,6 +331,7 @@ impl Backend {
 pub struct RateLimitLayer {
     backend: Backend,
     endpoint_config: Arc<EndpointConfig>,
+    trusted_proxies: TrustedProxyConfig,
 }
 
 impl RateLimitLayer {
@@ -336,6 +340,7 @@ impl RateLimitLayer {
         Self {
             backend: Backend::Redis(Arc::new(Mutex::new(conn))),
             endpoint_config: Arc::new(endpoint_config),
+            trusted_proxies: TrustedProxyConfig::none(),
         }
     }
 
@@ -344,7 +349,14 @@ impl RateLimitLayer {
         Self {
             backend: Backend::InMemory(Arc::new(Mutex::new(InMemoryStore::default()))),
             endpoint_config: Arc::new(endpoint_config),
+            trusted_proxies: TrustedProxyConfig::none(),
         }
+    }
+
+    /// Trust forwarding headers only from the configured proxy ranges.
+    pub fn with_trusted_proxies(mut self, trusted_proxies: TrustedProxyConfig) -> Self {
+        self.trusted_proxies = trusted_proxies;
+        self
     }
 
     /// Add a tenant-specific rate limit override.
@@ -374,6 +386,7 @@ impl<S> Layer<S> for RateLimitLayer {
             inner,
             backend: self.backend.clone(),
             endpoint_config: self.endpoint_config.clone(),
+            trusted_proxies: self.trusted_proxies.clone(),
         }
     }
 }
@@ -384,6 +397,7 @@ pub struct RateLimitService<S> {
     inner: S,
     backend: Backend,
     endpoint_config: Arc<EndpointConfig>,
+    trusted_proxies: TrustedProxyConfig,
 }
 
 impl<S> Service<Request> for RateLimitService<S>
@@ -408,10 +422,11 @@ where
         let mut inner = self.inner.clone();
         let backend = self.backend.clone();
         let endpoint_config = self.endpoint_config.clone();
+        let trusted_proxies = self.trusted_proxies.clone();
 
         Box::pin(async move {
             let path = req.uri().path().to_owned();
-            let identity = extract_identity(&req);
+            let identity = extract_identity(&req, &trusted_proxies);
             let config = endpoint_config.for_path(&path, Some(&identity));
             let endpoint_slug = path_to_slug(&path);
             let key = format!("rate_limit:{}:{}", endpoint_slug, identity);
@@ -454,7 +469,7 @@ where
 // ---------------------------------------------------------------------------
 
 /// Extract consumer identity from auth headers or fallback to IP.
-fn extract_identity(req: &Request<Body>) -> String {
+fn extract_identity(req: &Request<Body>, trusted_proxies: &TrustedProxyConfig) -> String {
     // 1. Check X-API-Key
     if let Some(key) = req.headers().get("x-api-key").and_then(|v| v.to_str().ok()) {
         return format!("apikey:{}", key);
@@ -472,33 +487,21 @@ fn extract_identity(req: &Request<Body>) -> String {
     }
 
     // 3. Fallback to IP
-    format!("ip:{}", extract_ip(req))
+    format!("ip:{}", extract_ip(req, trusted_proxies))
 }
 
-/// Extract client IP from common forwarding headers, falling back to loopback.
-fn extract_ip(req: &Request<Body>) -> IpAddr {
-    // X-Forwarded-For: client, proxy1, proxy2
-    if let Some(fwd) = req
-        .headers()
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-    {
-        if let Some(first) = fwd.split(',').next() {
-            if let Ok(ip) = first.trim().parse::<IpAddr>() {
-                return ip;
-            }
-        }
-    }
+/// Extract the client IP using the trusted-proxy boundary.
+///
+/// The TCP peer comes from `ConnectInfo`, which axum populates when the server
+/// is built with `into_make_service_with_connect_info`. Forwarding headers are
+/// only consulted when that peer is inside the configured allowlist.
+fn extract_ip(req: &Request<Body>, trusted_proxies: &TrustedProxyConfig) -> IpAddr {
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|info| info.0.ip());
 
-    // X-Real-IP: client
-    if let Some(real) = req.headers().get("x-real-ip").and_then(|v| v.to_str().ok()) {
-        if let Ok(ip) = real.trim().parse::<IpAddr>() {
-            return ip;
-        }
-    }
-
-    // Fallback — in production the load balancer always sets one of the above
-    IpAddr::from([127, 0, 0, 1])
+    resolve_client_ip_from_headers(req.headers(), peer, trusted_proxies)
 }
 
 /// Convert a URI path to a slug safe for use in Redis keys.
@@ -633,25 +636,57 @@ mod tests {
         assert_eq!(info2.remaining, 8);
     }
 
+    fn trusted() -> TrustedProxyConfig {
+        TrustedProxyConfig::parse("10.0.0.0/8").expect("valid config")
+    }
+
+    fn with_peer(mut req: Request<Body>, addr: &str) -> Request<Body> {
+        req.extensions_mut().insert(ConnectInfo(
+            addr.parse::<SocketAddr>().expect("valid peer address"),
+        ));
+        req
+    }
+
     #[test]
-    fn ip_extraction_prefers_x_forwarded_for() {
+    fn ip_extraction_uses_rightmost_untrusted_x_forwarded_for_hop() {
         use axum::http::Request;
-        let req = Request::builder()
-            .header("x-forwarded-for", "203.0.113.5, 10.0.0.1")
-            .body(Body::empty())
-            .unwrap();
-        let ip = extract_ip(&req);
+        let req = with_peer(
+            Request::builder()
+                .header("x-forwarded-for", "203.0.113.5, 10.0.0.1")
+                .body(Body::empty())
+                .unwrap(),
+            "10.0.0.254:443",
+        );
+        let ip = extract_ip(&req, &trusted());
         assert_eq!(ip, "203.0.113.5".parse::<IpAddr>().unwrap());
     }
 
     #[test]
-    fn ip_extraction_falls_back_to_x_real_ip() {
+    fn ip_extraction_ignores_forwarded_headers_from_untrusted_peer() {
         use axum::http::Request;
-        let req = Request::builder()
-            .header("x-real-ip", "192.0.2.42")
-            .body(Body::empty())
-            .unwrap();
-        let ip = extract_ip(&req);
+        let req = with_peer(
+            Request::builder()
+                .header("x-forwarded-for", "203.0.113.5")
+                .header("x-real-ip", "198.51.100.1")
+                .body(Body::empty())
+                .unwrap(),
+            "192.0.2.10:443",
+        );
+        let ip = extract_ip(&req, &trusted());
+        assert_eq!(ip, "192.0.2.10".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn ip_extraction_falls_back_to_x_real_ip_from_trusted_peer() {
+        use axum::http::Request;
+        let req = with_peer(
+            Request::builder()
+                .header("x-real-ip", "192.0.2.42")
+                .body(Body::empty())
+                .unwrap(),
+            "10.0.0.1:443",
+        );
+        let ip = extract_ip(&req, &trusted());
         assert_eq!(ip, "192.0.2.42".parse::<IpAddr>().unwrap());
     }
 
@@ -659,7 +694,7 @@ mod tests {
     fn ip_extraction_falls_back_to_loopback() {
         use axum::http::Request;
         let req = Request::builder().body(Body::empty()).unwrap();
-        let ip = extract_ip(&req);
+        let ip = extract_ip(&req, &TrustedProxyConfig::none());
         assert_eq!(ip, IpAddr::from([127, 0, 0, 1]));
     }
 
@@ -701,7 +736,7 @@ mod tests {
             .header("authorization", "Bearer should-be-ignored")
             .body(Body::empty())
             .unwrap();
-        let identity = extract_identity(&req);
+        let identity = extract_identity(&req, &TrustedProxyConfig::none());
         assert_eq!(identity, "apikey:secret-key-123");
     }
 
@@ -712,7 +747,7 @@ mod tests {
             .header("authorization", "Bearer my-token")
             .body(Body::empty())
             .unwrap();
-        let identity = extract_identity(&req);
+        let identity = extract_identity(&req, &TrustedProxyConfig::none());
         assert_eq!(identity, "token:my-token");
     }
 

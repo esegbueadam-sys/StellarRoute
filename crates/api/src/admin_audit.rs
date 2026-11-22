@@ -1,6 +1,7 @@
 use axum::http::HeaderMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::net::IpAddr;
 
 /// Simple structured admin audit entry used for admin operations (cache flush,
 /// kill-switch changes, etc.). Written as JSON to stdout by default.
@@ -19,10 +20,11 @@ pub fn build_admin_audit_entry(
     event: impl Into<String>,
     request_id: impl Into<String>,
     headers: &HeaderMap,
+    client_ip: IpAddr,
     resource: impl Into<String>,
     outcome: impl Into<String>,
 ) -> AdminAuditEntry {
-    let actor_raw = extract_actor(headers);
+    let actor_raw = extract_actor(headers, client_ip);
     let actor = redact_actor(&actor_raw);
 
     AdminAuditEntry {
@@ -68,10 +70,11 @@ fn redact_actor(actor: &str) -> String {
     }
 }
 
-/// Extract an actor string from common auth headers, falling back to IP.
-/// Mirrors the logic in `middleware::rate_limit::extract_identity` but returns
-/// a simple string suitable for audit logging.
-fn extract_actor(headers: &HeaderMap) -> String {
+/// Extract an actor string from common auth headers, falling back to the
+/// caller IP that was already resolved through the trusted-proxy boundary.
+/// Forwarding headers are never read directly here: they are only trustworthy
+/// when the TCP peer is a configured trusted proxy.
+fn extract_actor(headers: &HeaderMap, client_ip: IpAddr) -> String {
     // X-API-Key
     if let Some(key) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
         return format!("apikey:{}", key);
@@ -84,20 +87,7 @@ fn extract_actor(headers: &HeaderMap) -> String {
         }
     }
 
-    // Fallback to IP from forwarding headers
-    // X-Forwarded-For
-    if let Some(fwd) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-        if let Some(first) = fwd.split(',').next() {
-            return format!("ip:{}", first.trim());
-        }
-    }
-
-    if let Some(real) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
-        return format!("ip:{}", real.trim());
-    }
-
-    // Unknown — return loopback
-    "ip:127.0.0.1".to_string()
+    format!("ip:{client_ip}")
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -106,17 +96,36 @@ fn extract_actor(headers: &HeaderMap) -> String {
 mod tests {
     use super::*;
     use axum::http::HeaderMap;
+    use std::net::IpAddr;
+
+    fn client_ip(raw: &str) -> IpAddr {
+        raw.parse().expect("valid IP")
+    }
 
     #[test]
     fn redact_apikey_and_token() {
         let mut hm = HeaderMap::new();
         hm.insert("x-api-key", "secret-key-123".parse().unwrap());
-        let entry = build_admin_audit_entry("cache.flush", "req-1", &hm, "pairs", "success");
+        let entry = build_admin_audit_entry(
+            "cache.flush",
+            "req-1",
+            &hm,
+            client_ip("192.0.2.10"),
+            "pairs",
+            "success",
+        );
         assert_eq!(entry.actor, "apikey:[REDACTED]");
 
         let mut hm2 = HeaderMap::new();
         hm2.insert("authorization", "Bearer mytoken".parse().unwrap());
-        let entry2 = build_admin_audit_entry("ks.update", "req-2", &hm2, "kill_switch", "denied");
+        let entry2 = build_admin_audit_entry(
+            "ks.update",
+            "req-2",
+            &hm2,
+            client_ip("192.0.2.10"),
+            "kill_switch",
+            "denied",
+        );
         assert_eq!(entry2.actor, "token:[REDACTED]");
     }
 
@@ -124,7 +133,14 @@ mod tests {
     fn json_emitted_when_enabled() {
         std::env::remove_var("ADMIN_AUDIT_ENABLED");
         let hm = HeaderMap::new();
-        let entry = build_admin_audit_entry("cache.flush", "req-3", &hm, "pairs", "success");
+        let entry = build_admin_audit_entry(
+            "cache.flush",
+            "req-3",
+            &hm,
+            client_ip("192.0.2.10"),
+            "pairs",
+            "success",
+        );
         let json = emit_admin_audit(&entry).expect("json");
         assert!(json.contains("\"event\":\"cache.flush\""));
         assert!(json.contains("\"request_id\":\"req-3\""));
@@ -141,6 +157,7 @@ mod tests {
             "kill_switch.update",
             "req-ks-1",
             &hm,
+            client_ip("192.0.2.10"),
             "kill_switch",
             "success",
         );
@@ -152,10 +169,20 @@ mod tests {
     }
 
     #[test]
-    fn actor_falls_back_to_ip() {
+    fn actor_uses_resolved_client_ip_not_forwarding_headers() {
         let mut hm = HeaderMap::new();
         hm.insert("x-forwarded-for", "10.0.0.1, 1.2.3.4".parse().unwrap());
-        let entry = build_admin_audit_entry("cache.flush", "req-4", &hm, "all", "success");
-        assert!(entry.actor.starts_with("ip:"));
+        // The resolver has already decided the caller is 198.51.100.7 (the
+        // TCP peer of an untrusted request), so the audit entry must not pick
+        // a spoofable header value back up.
+        let entry = build_admin_audit_entry(
+            "cache.flush",
+            "req-4",
+            &hm,
+            client_ip("198.51.100.7"),
+            "all",
+            "success",
+        );
+        assert_eq!(entry.actor, "ip:198.51.100.7");
     }
 }

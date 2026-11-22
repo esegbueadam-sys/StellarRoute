@@ -21,6 +21,12 @@ Vercel frontend calls the tunnel hostname. Set `CORS_ALLOWED_ORIGINS` to
 `https://www.stellarroute.app`, `https://stellarroute.app`, and the Vercel
 origin(s).
 
+Because `cloudflared` reaches the API over loopback, set
+`TRUSTED_PROXY_CIDRS=127.0.0.1/32,::1/128` in `.env.prod` so per-client rate
+limits and admin audit attribution use the caller IP from `X-Forwarded-For`
+instead of the tunnel's loopback address. Leave it empty to ignore forwarding
+headers entirely (see [`docs/api/trusted-proxy-client-ip.md`](../api/trusted-proxy-client-ip.md)).
+
 ## Prerequisites
 
 - Oracle Cloud account with Always Free eligibility

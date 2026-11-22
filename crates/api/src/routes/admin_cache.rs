@@ -2,9 +2,11 @@ use crate::admin_audit::{build_admin_audit_entry, emit_admin_audit};
 use crate::error::Result;
 use crate::middleware::{AdminAuth, RequestId};
 use crate::state::AppState;
+use axum::extract::ConnectInfo;
 use axum::http::HeaderMap;
 use axum::{extract::State, Json};
 use serde::Deserialize;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::info;
 
@@ -20,6 +22,7 @@ pub async fn flush_cache(
     _admin: AdminAuth,
     headers: HeaderMap,
     request_id: RequestId,
+    peer: Option<ConnectInfo<SocketAddr>>,
     Json(payload): Json<CacheFlushRequest>,
 ) -> Result<Json<serde_json::Value>> {
     info!("Admin cache flush requested: {:?}", payload);
@@ -49,10 +52,16 @@ pub async fn flush_cache(
     };
 
     // Emit admin audit
+    let client_ip = crate::client_ip::resolve_client_ip_from_headers(
+        &headers,
+        peer.map(|ConnectInfo(addr)| addr.ip()),
+        &state.trusted_proxies,
+    );
     let entry = build_admin_audit_entry(
         "cache.flush",
         request_id.as_str(),
         &headers,
+        client_ip,
         resource.clone(),
         "success",
     );

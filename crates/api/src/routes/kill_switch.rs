@@ -3,8 +3,10 @@ use crate::error::{ApiError, Result};
 use crate::kill_switch::KillSwitchState;
 use crate::middleware::{AdminAuth, RequestId};
 use crate::state::AppState;
+use axum::extract::ConnectInfo;
 use axum::http::HeaderMap;
 use axum::{extract::State, Json};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::info;
 
@@ -46,6 +48,7 @@ pub async fn update_kill_switch(
     _admin: AdminAuth,
     headers: HeaderMap,
     request_id: RequestId,
+    peer: Option<ConnectInfo<SocketAddr>>,
     Json(payload): Json<KillSwitchState>,
 ) -> Result<Json<serde_json::Value>> {
     info!("Admin updating kill switch state: {:?}", payload);
@@ -57,10 +60,16 @@ pub async fn update_kill_switch(
         .map_err(|e| ApiError::from(anyhow::anyhow!(e)))?;
 
     // Emit admin audit entry
+    let client_ip = crate::client_ip::resolve_client_ip_from_headers(
+        &headers,
+        peer.map(|ConnectInfo(addr)| addr.ip()),
+        &state.trusted_proxies,
+    );
     let entry = build_admin_audit_entry(
         "kill_switch.update",
         request_id.as_str(),
         &headers,
+        client_ip,
         "kill_switch",
         "success",
     );
